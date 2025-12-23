@@ -1,325 +1,207 @@
-import os
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-
-# 3D plotting
 import plotly.graph_objects as go
-import plotly.io as pio 
+import plotly.express as px
+import plotly.io as pio
+from sklearn.ensemble import HistGradientBoostingRegressor # <--- FASTEST sklearn model
+from sklearn.preprocessing import StandardScaler
 
 # Force Plotly to open in browser
 pio.renderers.default = "browser"
 
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error
-
 # ============================================================
-# 0) UTILITIES & MATH HELPERS
+# 1) ORBITAL MECHANICS: THE RIC FRAME (The "Clockwork" Math)
 # ============================================================
+MU_EARTH = 398600.4418
 
-def show_df(df, name="DataFrame", n=5):
-    print(f"\n--- {name} (shape={df.shape}) ---")
-    print(df.head(n).to_string(index=False))
-
-def angle_diff(a, b):
+def eci2ric(r_sim, v_sim, r_true, v_true):
     """
-    Calculates smallest difference between two angles in radians.
-    Solves the 'wrapping' problem: diff(0.1, 6.2) should be small, not big.
+    Converts errors from Earth-Centered Inertial (ECI) to 
+    Radial-Intrack-Crosstrack (RIC) frame.
     """
-    diff = a - b
-    return (diff + np.pi) % (2 * np.pi) - np.pi
-
-# ============================================================
-# 1) DATA LOADING
-# ============================================================
-
-def load_data(base_path):
-    print(f"Loading data from {base_path}...")
-    train_df = pd.read_csv(os.path.join(base_path, "jan_train.csv"))
-    test_df = pd.read_csv(os.path.join(base_path, "jan_test.csv"))
-    answer_df = pd.read_csv(os.path.join(base_path, "answer_key.csv"))
-
-    # Prepare Train Table
-    train_table = train_df.copy()
-    train_table["set"] = "train"
-
-    # Prepare Test Table
-    test_preds = test_df.copy()
+    r_norm = np.linalg.norm(r_sim, axis=1)
+    uR = r_sim / r_norm[:, None]
     
-    # Inject answers for validation purposes (Ground Truth)
-    target_cols = ["x", "y", "z", "Vx", "Vy", "Vz"]
-    test_preds[target_cols] = answer_df[target_cols].values
-    test_preds["set"] = "test"
+    h_vec = np.cross(r_sim, v_sim)
+    h_norm = np.linalg.norm(h_vec, axis=1)
+    uC = h_vec / h_norm[:, None]
+    
+    uI = np.cross(uC, uR)
+    
+    delta_r = r_true - r_sim
+    
+    # Project Error onto RIC Vectors
+    d_rad = np.sum(delta_r * uR, axis=1)
+    d_int = np.sum(delta_r * uI, axis=1)
+    d_cro = np.sum(delta_r * uC, axis=1)
+    
+    return np.column_stack([d_rad, d_int, d_cro])
 
-    return train_table, test_preds
+def ric2eci(r_sim, v_sim, ric_corrections):
+    """
+    Converts predicted RIC corrections back to ECI to reconstruct the path.
+    """
+    r_norm = np.linalg.norm(r_sim, axis=1)
+    uR = r_sim / r_norm[:, None]
+    
+    h_vec = np.cross(r_sim, v_sim)
+    h_norm = np.linalg.norm(h_vec, axis=1)
+    uC = h_vec / h_norm[:, None]
+    
+    uI = np.cross(uC, uR)
+    
+    d_rad = ric_corrections[:, 0][:, None]
+    d_int = ric_corrections[:, 1][:, None]
+    d_cro = ric_corrections[:, 2][:, None]
+    
+    delta_r = (d_rad * uR) + (d_int * uI) + (d_cro * uC)
+    
+    return r_sim + delta_r
 
 # ============================================================
-# 2) KEPLERIAN MATH
+# 2) FEATURE ENGINEERING (Standard Keplerian Input)
 # ============================================================
 
-MU_EARTH = 398600.4418  # km^3/s^2
-
-def cart2kep(r_vec, v_vec):
-    """
-    Vectorized Cartesian -> Keplerian conversion.
-    Returns: [a, e, i, Omega, w, M]
-    """
-    # Magnitudes
+def cart2kep_simple(r_vec, v_vec):
+    """Simplified conversion for feature generation."""
     r = np.linalg.norm(r_vec, axis=1)
     v = np.linalg.norm(v_vec, axis=1)
+    h = np.linalg.norm(np.cross(r_vec, v_vec), axis=1)
     
-    # Angular momentum
-    h_vec = np.cross(r_vec, v_vec)
-    h = np.linalg.norm(h_vec, axis=1)
+    energy = (v**2)/2 - MU_EARTH/r
+    a = -MU_EARTH / (2 * energy)
     
-    # Node vector
-    n_x = -h_vec[:, 1]
-    n_y = h_vec[:, 0]
-    n = np.sqrt(n_x**2 + n_y**2)
-    
-    # Eccentricity
-    r_dot_v = np.sum(r_vec * v_vec, axis=1)
-    term1 = (v**2 - MU_EARTH/r)[:, np.newaxis] * r_vec
-    term2 = r_dot_v[:, np.newaxis] * v_vec
-    e_vec = (term1 - term2) / MU_EARTH
+    e_vec = np.cross(v_vec, np.cross(r_vec, v_vec))/MU_EARTH - r_vec/r[:,None]
     e = np.linalg.norm(e_vec, axis=1)
     
-    # Semi-major axis
-    specific_energy = (v**2)/2 - MU_EARTH/r
-    a = -MU_EARTH / (2 * specific_energy)
+    inc = np.arccos(np.clip(np.cross(r_vec, v_vec)[:, 2] / h, -1, 1))
     
-    # Inclination
-    inc = np.arccos(np.clip(h_vec[:, 2] / h, -1, 1))
-    
-    # RAAN (Omega)
-    Omega = np.arccos(np.clip(n_x / (n + 1e-9), -1, 1))
-    Omega[n_y < 0] = 2*np.pi - Omega[n_y < 0]
-    
-    # Argument of Perigee (w)
-    n_dot_e = n_x*e_vec[:,0] + n_y*e_vec[:,1]
-    w = np.arccos(np.clip(n_dot_e / (n * e + 1e-9), -1, 1))
-    w[e_vec[:, 2] < 0] = 2*np.pi - w[e_vec[:, 2] < 0]
-    
-    # True Anomaly (nu)
-    e_dot_r = np.sum(e_vec * r_vec, axis=1)
-    nu = np.arccos(np.clip(e_dot_r / (e * r + 1e-9), -1, 1))
-    nu[r_dot_v < 0] = 2*np.pi - nu[r_dot_v < 0]
-    
-    # Mean Anomaly (M)
-    E_ecc = 2 * np.arctan(np.sqrt((1 - e)/(1 + e + 1e-9)) * np.tan(nu/2))
-    M = E_ecc - e * np.sin(E_ecc)
-    
-    return np.column_stack([a, e, inc, Omega, w, M])
+    return np.column_stack([a, e, inc])
 
-def kep2cart(kep_arr):
-    """
-    Vectorized Keplerian -> Cartesian conversion.
-    Input: [a, e, i, Omega, w, M]
-    """
-    a, e, inc, Omega, w, M = kep_arr.T
-    
-    # Solve Kepler Eq for E (approx)
-    E = M.copy()
-    for _ in range(5):
-        E = E - (E - e*np.sin(E) - M) / (1 - e*np.cos(E))
-        
-    # True Anomaly
-    sqrt_term = np.sqrt((1+e)/(1-e + 1e-9))
-    nu = 2 * np.arctan(sqrt_term * np.tan(E/2))
-    
-    # Perifocal coords
-    r_dist = a * (1 - e * np.cos(E))
-    p = r_dist * np.cos(nu)
-    q = r_dist * np.sin(nu)
-    
-    h = np.sqrt(MU_EARTH * a * (1 - e**2 + 1e-9))
-    mu_over_h = MU_EARTH / (h + 1e-9)
-    vp = -mu_over_h * np.sin(nu)
-    vq =  mu_over_h * (e + np.cos(nu))
-    
-    # Rotation to ECI
-    cO, sO = np.cos(Omega), np.sin(Omega)
-    cw, sw = np.cos(w), np.sin(w)
-    ci, si = np.cos(inc), np.sin(inc)
-    
-    P_x = cO*cw - sO*sw*ci
-    P_y = sO*cw + cO*sw*ci
-    P_z = sw*si
-    
-    Q_x = -cO*sw - sO*cw*ci
-    Q_y = -sO*sw + cO*cw*ci
-    Q_z = cw*si
-    
-    x = p*P_x + q*Q_x
-    y = p*P_y + q*Q_y
-    z = p*P_z + q*Q_z
-    
-    vx = vp*P_x + vq*Q_x
-    vy = vp*P_y + vq*Q_y
-    vz = vp*P_z + vq*Q_z
-    
-    return np.column_stack([x, y, z, vx, vy, vz])
-
-# ============================================================
-# 3) FEATURE ENGINEERING (SMART ANGLES)
-# ============================================================
-
-def get_keplerian_data(df, is_train=True):
-    # 1. Convert SIM data to Keplerian
+def get_ric_data(df, is_train=True):
     r_sim = df[["x_sim", "y_sim", "z_sim"]].values
     v_sim = df[["Vx_sim", "Vy_sim", "Vz_sim"]].values
-    k_sim = cart2kep(r_sim, v_sim) # [a, e, i, Om, w, M]
     
-    # 2. Build Feature Matrix X (Transform angles to sin/cos!)
-    # This prevents the model from seeing a "jump" at 360 degrees
+    kep_sim = cart2kep_simple(r_sim, v_sim) # [a, e, i]
+    
     X = pd.DataFrame(index=df.index)
-    X["a_sim"] = k_sim[:, 0]
-    X["e_sim"] = k_sim[:, 1]
+    X["a_sim"] = kep_sim[:, 0]
+    X["e_sim"] = kep_sim[:, 1]
+    X["i_sim"] = kep_sim[:, 2]
     
-    # For all angles (idx 2,3,4,5), add sin and cos components
-    angle_names = ["i", "Om", "w", "M"]
-    for idx, name in enumerate(angle_names, start=2):
-        X[f"sin_{name}"] = np.sin(k_sim[:, idx])
-        X[f"cos_{name}"] = np.cos(k_sim[:, idx])
-        
-    # Extra physics feature: Mean Motion n
-    X["n_motion"] = np.sqrt(MU_EARTH / X["a_sim"]**3)
-
+    # Time proxy (normalized index per satellite)
+    X["time_step"] = df.groupby("sat_id").cumcount()
+    
     y = None
     if is_train:
-        # 3. Compute Targets (Errors)
         r_true = df[["x", "y", "z"]].values
         v_true = df[["Vx", "Vy", "Vz"]].values
-        k_true = cart2kep(r_true, v_true)
         
-        y = pd.DataFrame(index=df.index)
+        # Target: The RIC Error
+        ric_errors = eci2ric(r_sim, v_sim, r_true, v_true)
+        y = pd.DataFrame(ric_errors, columns=["dR", "dI", "dC"], index=df.index)
         
-        # Simple difference for a and e
-        y["d_a"] = k_true[:, 0] - k_sim[:, 0]
-        y["d_e"] = k_true[:, 1] - k_sim[:, 1]
-        
-        # Angular difference for others (handling wrap)
-        for idx, name in enumerate(angle_names, start=2):
-            y[f"d_{name}"] = angle_diff(k_true[:, idx], k_sim[:, idx])
-            
-    return X, y, k_sim
+    return X, y
 
 # ============================================================
-# 4) MODELING
+# 3) MODELING (SPEED OPTIMIZED)
 # ============================================================
 
-def train_correction_model(train_df):
-    print("\n[ML] Engineering Keplerian Features...")
-    
-    # Filter valid data
+def train_ric_model(train_df):
+    print("[Mission Control] Converting to RIC Frame & Training...")
     train_df = train_df.dropna(subset=["x_sim", "x"])
-    X, y, _ = get_keplerian_data(train_df, is_train=True)
     
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    X, y = get_ric_data(train_df, is_train=True)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
     
-    # Random Forest with Smoothing
-    # min_samples_leaf=5 prevents the model from being too "twitchy"
-    model = RandomForestRegressor(
-        n_estimators=100,
-        max_depth=15,
-        min_samples_leaf=10,  # <--- Key for smoothing
-        n_jobs=-1,
+    # HistGradientBoosting is usually 10-50x faster than standard GradientBoosting
+    model = HistGradientBoostingRegressor(
+        max_iter=100,          # Reduced iterations
+        max_depth=5,           # Shallow trees for speed
+        learning_rate=0.1,
         random_state=42
     )
     
-    print("[ML] Training Random Forest...")
-    model.fit(X_train, y_train)
+    from sklearn.multioutput import MultiOutputRegressor
+    multi_model = MultiOutputRegressor(model, n_jobs=-1) # Parallelized
     
-    print(f"[ML] Validation Score (R^2): {model.score(X_val, y_val):.4f}")
-    return model, X.columns.tolist()
+    print("[Mission Control] Fitting Fast RIC Model...")
+    multi_model.fit(X_scaled, y)
+    
+    return multi_model, scaler, X.columns.tolist()
 
-def apply_correction(df, model, feature_cols):
-    print("Applying corrections...")
+def apply_ric_correction(df, model, scaler, feature_cols):
     valid_mask = df[["x_sim", "y_sim", "z_sim"]].notna().all(axis=1)
     df_valid = df.loc[valid_mask].copy()
     
-    if len(df_valid) == 0: return df
+    X, _ = get_ric_data(df_valid, is_train=False)
+    X_scaled = scaler.transform(X)
     
-    # Prepare Inputs
-    X, _, k_sim = get_keplerian_data(df_valid, is_train=False)
-    X = X[feature_cols]
+    preds_ric = model.predict(X_scaled)
     
-    # Predict Angular Errors
-    pred_diffs = model.predict(X)
+    r_sim = df_valid[["x_sim", "y_sim", "z_sim"]].values
+    v_sim = df_valid[["Vx_sim", "Vy_sim", "Vz_sim"]].values
     
-    # Apply Corrections
-    # k_sim structure: [a, e, i, Om, w, M]
-    # pred structure:  [d_a, d_e, d_i, d_Om, d_w, d_M]
-    
-    k_corr = k_sim.copy()
-    k_corr[:, 0] += pred_diffs[:, 0] # a
-    k_corr[:, 1] += pred_diffs[:, 1] # e
-    
-    # For angles, just add the diff (wrap handled by sin/cos in reconstruction)
-    for i in range(4):
-        k_corr[:, i+2] += pred_diffs[:, i+2]
-        
-    # Convert back to Cartesian
-    cart_corr = kep2cart(k_corr)
+    r_corrected = ric2eci(r_sim, v_sim, preds_ric)
     
     out_df = df.copy()
-    coords = ["x", "y", "z", "Vx", "Vy", "Vz"]
-    for i, col in enumerate(coords):
-        out_df.loc[valid_mask, f"{col}_pred"] = cart_corr[:, i]
+    for i, col in enumerate(["x", "y", "z"]):
+        out_df.loc[valid_mask, f"{col}_pred"] = r_corrected[:, i]
         
     return out_df
 
 # ============================================================
-# 5) VISUALIZATION
+# 4) VISUALIZATION
 # ============================================================
 
-def cut_one_orbit(df, suffix=""):
-    """Simple geometric cut for plotting 1 orbit"""
-    if len(df) < 100: return df
-    # Just take first 600 points (approx 1 orbit for LEO) to keep it simple
-    return df.iloc[:600]
-
-def visualize_multiple(df, sat_ids):
+def visualize_ric_mission(df, sat_id, exag_factor=20.0):
+    sub = df[df["sat_id"] == sat_id].sort_values("id")
+    if len(sub) == 0: return
+    
+    # Plot first orbit only for clarity
+    sub = sub.iloc[:1000] 
+    
+    print(f"[Viz] Sat {sat_id} (RIC Correction, {exag_factor}x Exag)")
+    
     fig = go.Figure()
     
-    # Earth Sphere
-    u, v = np.mgrid[0:2*np.pi:20j, 0:np.pi:10j]
+    r_sim = sub[["x_sim", "y_sim", "z_sim"]].values
+    r_true = sub[["x", "y", "z"]].values
+    r_ml = sub[["x_pred", "y_pred", "z_pred"]].values
+    
+    r_true_plot = r_sim + (r_true - r_sim) * exag_factor
+    r_ml_plot = r_sim + (r_ml - r_sim) * exag_factor
+    
+    # 1. Baseline Sim (Orange)
+    fig.add_trace(go.Scatter3d(
+        x=r_sim[:,0], y=r_sim[:,1], z=r_sim[:,2],
+        mode='lines', name='SGP4 Baseline',
+        line=dict(color='orange', width=2, dash='dashdot'), opacity=0.4
+    ))
+    
+    # 2. Ground Truth (Cyan)
+    fig.add_trace(go.Scatter3d(
+        x=r_true_plot[:,0], y=r_true_plot[:,1], z=r_true_plot[:,2],
+        mode='lines', name=f'Ground Truth ({exag_factor}x)',
+        line=dict(color='cyan', width=6)
+    ))
+    
+    # 3. RIC Corrected (Lime Green)
+    fig.add_trace(go.Scatter3d(
+        x=r_ml_plot[:,0], y=r_ml_plot[:,1], z=r_ml_plot[:,2],
+        mode='lines', name=f'RIC Corrected ({exag_factor}x)',
+        line=dict(color='lime', width=4)
+    ))
+    
+    # Earth
+    u, v = np.mgrid[0:2*np.pi:30j, 0:np.pi:15j]
     x = 6371 * np.cos(u)*np.sin(v)
     y = 6371 * np.sin(u)*np.sin(v)
     z = 6371 * np.cos(v)
-    fig.add_surface(x=x, y=y, z=z, colorscale='Blues', opacity=0.3, showscale=False)
+    fig.add_trace(go.Surface(x=x, y=y, z=z, colorscale='Blues', opacity=0.1, showscale=False))
 
-    colors = ['cyan', 'magenta', 'lime', 'yellow']
-    
-    for i, sid in enumerate(sat_ids):
-        sub = df[df["sat_id"] == sid].sort_values("id") # Ensure time order
-        if len(sub) == 0: continue
-        
-        # Cut to first orbit for clarity
-        sub = cut_one_orbit(sub)
-        
-        c = colors[i % len(colors)]
-        
-        # Ground Truth (Solid)
-        fig.add_trace(go.Scatter3d(
-            x=sub.x, y=sub.y, z=sub.z,
-            mode='lines', name=f'Sat {sid} (True)',
-            line=dict(color=c, width=4)
-        ))
-        
-        # ML Prediction (Dashed)
-        fig.add_trace(go.Scatter3d(
-            x=sub.x_pred, y=sub.y_pred, z=sub.z_pred,
-            mode='lines', name=f'Sat {sid} (ML)',
-            line=dict(color='white', width=3, dash='dash')
-        ))
-
-    fig.update_layout(
-        title="Multi-Satellite Trajectory Correction",
-        template="plotly_dark",
-        scene=dict(aspectmode='data')
-    )
+    fig.update_layout(title=f"Sat {sat_id}: RIC Correction", template="plotly_dark", scene=dict(aspectmode='data'))
     fig.show()
 
 # ============================================================
@@ -327,22 +209,33 @@ def visualize_multiple(df, sat_ids):
 # ============================================================
 
 def main():
-    path = os.getcwd()
-    train_table, test_preds = load_data(path)
+    print("Loading data...")
+    train_full = pd.read_csv("jan_train.csv")
     
-    # Train on a subset for speed
-    train_subset = train_table[train_table["sat_id"] < 200] 
+    # SPEED FILTER: Only use 25 good satellites for training
+    counts = train_full["sat_id"].value_counts()
+    valid_sats = counts[counts > 500].index.tolist()
     
-    model, features = train_correction_model(train_subset)
+    train_sats = valid_sats[:25] # Reduced from 40 to 25
+    demo_sats = valid_sats[25:30]
     
-    print("\n[Prediction] Applying model to Test set...")
-    results = apply_correction(test_preds, model, features)
+    train_data = train_full[train_full["sat_id"].isin(train_sats)].copy()
+    demo_data = train_full[train_full["sat_id"].isin(demo_sats)].copy()
     
-    # Pick 3 random satellites to visualize
-    sample_sats = np.random.choice(results["sat_id"].unique(), 3, replace=False)
-    print(f"\nVisualizing Satellites: {sample_sats}")
+    # Train
+    model, scaler, cols = train_ric_model(train_data)
     
-    visualize_multiple(results, sample_sats)
+    # Apply
+    print("Applying corrections...")
+    res_list = []
+    for sid in demo_sats:
+        sub = demo_data[demo_data["sat_id"] == sid].copy().sort_values("id")
+        res_list.append(apply_ric_correction(sub, model, scaler, cols))
+    
+    demo_res = pd.concat(res_list)
+    
+    # Visualize first result
+    visualize_ric_mission(demo_res, demo_sats[0], exag_factor=30.0)
 
 if __name__ == "__main__":
     main()
