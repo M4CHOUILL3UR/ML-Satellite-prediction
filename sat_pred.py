@@ -10,361 +10,405 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 
-# Helper to print df shape/head quickly
-def show_df(df, name="DataFrame", n=10):
-    print(f"\n--- {name} (shape={df.shape}) ---")
+# ============================================================
+# 0) UTILITIES
+# ============================================================
+
+def show_df(df, name="DataFrame", n=5):
+    print(f"\\n--- {name} (shape={df.shape}) ---")
     print(df.head(n).to_string(index=False))
 
+# ============================================================
+# 1) DATA LOADING
+# ============================================================
+
 def load_data(base_path):
-    # Load raw csvs
     print(f"Loading data from {base_path}...")
     train_df = pd.read_csv(os.path.join(base_path, "jan_train.csv"))
     test_df = pd.read_csv(os.path.join(base_path, "jan_test.csv"))
     answer_df = pd.read_csv(os.path.join(base_path, "answer_key.csv"))
 
-    # Select relevant cols for training
-    train_table = train_df[[
-        "id", "sat_id",
-        "x", "y", "z", "Vx", "Vy", "Vz",
-        "x_sim", "y_sim", "z_sim", "Vx_sim", "Vy_sim", "Vz_sim"
-    ]].copy()
+    # Prepare Train Table
+    # We only keep rows where we have both Real and Sim data (though usually train has both)
+    train_table = train_df.copy()
     train_table["set"] = "train"
 
-    # Merge answer key into test for evaluation later
-    pred_cols = ["x", "y", "z", "Vx", "Vy", "Vz"]
-    test_preds = test_df.copy().reset_index(drop=True)
-    test_preds[pred_cols] = answer_df[pred_cols].values
-    test_preds["set"] = "test_pred"
+    # Prepare Test Table (Predict mode)
+    # The test_df usually has '_sim' columns but NO 'x','y','z'.
+    # We inject the answer key purely for final evaluation/plotting, 
+    # but strictly we shouldn't use these columns for input features.
+    test_preds = test_df.copy()
+    
+    # Inject answers for validation purposes (Ground Truth)
+    target_cols = ["x", "y", "z", "Vx", "Vy", "Vz"]
+    test_preds[target_cols] = answer_df[target_cols].values
+    test_preds["set"] = "test"
 
-    # specific use case: merging all for visualization context
+    # Concat for visualization if needed
     merged_all = pd.concat([train_table, test_preds], ignore_index=True)
 
-    return train_df, test_df, answer_df, train_table, test_preds, merged_all
+    return train_table, test_preds, merged_all
 
-# Basic geometric cut to isolate one orbit
-def cut_after_one_orbit_3D(df):
+# ============================================================
+# 2) ORBIT CUTTER (Geometric Helper)
+# ============================================================
+
+def cut_after_one_orbit_3D(df, coord_cols=["x", "y", "z"], vel_cols=["Vx", "Vy", "Vz"]):
+    """
+    Cuts the trajectory after one full revolution (2pi radians) 
+    based on the angular change in the orbital plane.
+    """
     df = df.copy()
-    cols = ["x", "y", "z", "Vx", "Vy", "Vz"]
-
-    # cleanup duplicates if any exist
-    if df.columns.duplicated().any():
-        df = df.loc[:, ~df.columns.duplicated()].copy()
-
-    # ensure numeric
-    for c in cols:
-        col = df[c]
-        if isinstance(col, pd.DataFrame):
-            col = col.iloc[:, 0]
-        df[c] = pd.to_numeric(col, errors="coerce")
-
-    df = df.dropna(subset=cols)
-    if df.shape[0] < 5:
+    
+    # Check if columns exist
+    if not all(c in df.columns for c in coord_cols + vel_cols):
         return df
 
-    # Vector math to find orbit plane
-    r = df[["x", "y", "z"]].to_numpy(dtype=float)
-    v = df[["Vx", "Vy", "Vz"]].to_numpy(dtype=float)
+    # Drop NaNs in trajectory
+    df = df.dropna(subset=coord_cols + vel_cols)
+    if len(df) < 10:
+        return df
 
+    # Extract position (r) and velocity (v)
+    r = df[coord_cols].to_numpy(dtype=float)
+    v = df[vel_cols].to_numpy(dtype=float)
+
+    # Angular momentum vector h = r x v
     hv = np.cross(r, v)
     h = np.nanmean(hv, axis=0)
     hn = np.linalg.norm(h)
     
-    # Filter weird data
-    if not np.isfinite(hn) or hn < 1e-12:
-        return df
+    if hn < 1e-9:
+        return df # degenerate orbit
 
     h = h / hn
-    
-    # arbitrary axis setup
+
+    # Define an arbitrary reference frame in the orbital plane
+    # u_axis perpen to h
     u_axis = np.cross(h, np.array([1.0, 0.0, 0.0]))
-    if np.linalg.norm(u_axis) < 1e-6:
+    if np.linalg.norm(u_axis) < 1e-3:
         u_axis = np.cross(h, np.array([0.0, 1.0, 0.0]))
-    u_axis = u_axis / np.linalg.norm(u_axis)
+    u_axis /= np.linalg.norm(u_axis)
+    
     v_axis = np.cross(h, u_axis)
 
-    u = r @ u_axis
-    w = r @ v_axis
+    # Project position onto this plane
+    u = (r @ u_axis[:, None]).flatten()
+    w = (r @ v_axis[:, None]).flatten()
+    
+    # Calculate angle theta
     theta = np.unwrap(np.arctan2(w, u))
 
-    # Cut when theta completes a circle
-    theta0 = theta[0]
-    mask = (theta - theta0) <= 2 * np.pi
+    # Select one loop (0 to 2pi)
+    if len(theta) == 0:
+        return df
+        
+    start_theta = theta[0]
+    mask = (theta - start_theta) <= 2 * np.pi
+    
     return df.loc[mask].copy()
 
-def compute_train_metrics(train_table, out_csv_path):
-    metrics = []
-    # iterating per sat to get individual errors
-    for sat in train_table["sat_id"].unique():
-        subset = train_table[train_table["sat_id"] == sat]
+# ============================================================
+# 3) FEATURE ENGINEERING
+# ============================================================
 
-        pos_rmse = np.sqrt(np.mean(
-            (subset[["x", "y", "z"]].values - subset[["x_sim", "y_sim", "z_sim"]].values) ** 2
-        ))
-        vel_rmse = np.sqrt(np.mean(
-            (subset[["Vx", "Vy", "Vz"]].values - subset[["Vx_sim", "Vy_sim", "Vz_sim"]].values) ** 2
-        ))
+def get_physics_features(df, suffix=""):
+    """
+    Generates physics-based features for a set of columns.
+    suffix: "" for real columns (x, y...), "_sim" for simulation columns (x_sim, y_sim...)
+    """
+    # Map generic names to actual columns
+    cx, cy, cz = f"x{suffix}", f"y{suffix}", f"z{suffix}"
+    vx, vy, vz = f"Vx{suffix}", f"Vy{suffix}", f"Vz{suffix}"
+    
+    # Check availability
+    req = [cx, cy, cz, vx, vy, vz]
+    if not all(c in df.columns for c in req):
+        # Return empty or partial if cols missing
+        return pd.DataFrame(index=df.index)
 
-        metrics.append({"sat_id": sat, "pos_RMSE": pos_rmse, "vel_RMSE": vel_rmse})
+    X = df[req].astype(float)
+    
+    # 1. Position Magnitude (Radius)
+    r = np.sqrt(X[cx]**2 + X[cy]**2 + X[cz]**2)
+    
+    # 2. Velocity Magnitude (Speed)
+    s = np.sqrt(X[vx]**2 + X[vy]**2 + X[vz]**2)
+    
+    # 3. Angular Momentum (Specific) h = r x v
+    hx = X[cy]*X[vz] - X[cz]*X[vy]
+    hy = X[cz]*X[vx] - X[cx]*X[vz]
+    hz = X[cx]*X[vy] - X[cy]*X[vx]
+    h = np.sqrt(hx**2 + hy**2 + hz**2)
+    
+    # 4. Energy (Specific Mechanical Energy) E = v^2/2 - mu/r
+    # mu for Earth approx 398600 km^3/s^2
+    mu = 398600.0
+    energy = (s**2)/2 - mu/(r + 1e-9)
 
-    metrics_df = pd.DataFrame(metrics).sort_values("sat_id")
-    metrics_df.to_csv(out_csv_path, index=False)
-    return metrics_df
+    feat_df = pd.DataFrame(index=df.index)
+    feat_df[f"r{suffix}"] = r
+    feat_df[f"speed{suffix}"] = s
+    feat_df[f"h_norm{suffix}"] = h
+    feat_df[f"energy{suffix}"] = energy
+    
+    # Cosines / Sines of position (directionality)
+    feat_df[f"cos_x{suffix}"] = X[cx] / (r + 1e-9)
+    feat_df[f"cos_y{suffix}"] = X[cy] / (r + 1e-9)
+    feat_df[f"cos_z{suffix}"] = X[cz] / (r + 1e-9)
+    
+    return feat_df
 
-def plot_matplotlib_3d_sample(merged_all, nb_sats=15, R_earth=6371):
-    # filter for usable satellites
-    valid_sats = [
-        sat for sat in merged_all["sat_id"].unique()
-        if merged_all.loc[merged_all["sat_id"] == sat, ["x", "y", "z"]].dropna().shape[0] > 20
-    ]
-    if not valid_sats:
-        print("No valid satellites for matplotlib plot.")
-        return
+def prepare_ml_data(df, target_cols=["x", "y", "z", "Vx", "Vy", "Vz"]):
+    """
+    Prepares X (features from SIM) and y (RESIDUAL = Real - Sim).
+    """
+    df = df.copy()
+    
+    # 1. Base Features from Simulation
+    sim_cols = ["x_sim", "y_sim", "z_sim", "Vx_sim", "Vy_sim", "Vz_sim"]
+    
+    # Drop rows where we lack targets (Real data) or inputs (Sim data)
+    # Note: For training we need both. For prediction we only need Sim.
+    valid_mask = df[target_cols + sim_cols].notna().all(axis=1)
+    df = df.loc[valid_mask].copy()
 
-    sample_sats = np.random.choice(valid_sats, size=min(nb_sats, len(valid_sats)), replace=False)
-    print(f"\nPlotting sample (matplotlib): {sample_sats}")
+    # Generate derived features on SIM data
+    phys_feats = get_physics_features(df, suffix="_sim")
+    
+    # Combine Raw Sim + Derived Sim as Input X
+    X = pd.concat([df[sim_cols], phys_feats], axis=1)
+    
+    # Calculate Target: Residual (Real - Sim)
+    y = pd.DataFrame(index=df.index)
+    for col in target_cols:
+        sim_col = col + "_sim"
+        y[f"diff_{col}"] = df[col] - df[sim_col]
+        
+    return X, y
 
-    fig = plt.figure(figsize=(12, 10))
-    ax = fig.add_subplot(111, projection="3d")
+# ============================================================
+# 4) MODELING
+# ============================================================
 
-    # Wireframe earth
-    u = np.linspace(0, 2*np.pi, 60)
-    v = np.linspace(0, np.pi, 30)
-    xs = R_earth * np.outer(np.cos(u), np.sin(v))
-    ys = R_earth * np.outer(np.sin(u), np.sin(v))
-    zs = R_earth * np.outer(np.ones_like(u), np.cos(v))
-    ax.plot_surface(xs, ys, zs, color="lightblue", alpha=0.35, linewidth=0)
+def train_correction_model(train_df):
+    """
+    Trains a model to predict the error of the simulation.
+    """
+    print("\\n[ML] Preparing training data...")
+    X, y = prepare_ml_data(train_df)
+    
+    # Split
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    print(f"[ML] Training shape: {X_train.shape}")
+    
+    # Using RandomForest. 
+    # Note: HistGradientBoostingRegressor is often better for this but RF is standard.
+    model = RandomForestRegressor(
+        n_estimators=50,      # kept low for speed given 'student' project
+        max_depth=15,         # limit depth to prevent overfitting
+        n_jobs=-1,
+        random_state=42
+    )
+    
+    
+    
+    print("[ML] Fitting Random Forest...")
+    model.fit(X_train, y_train)
+    
+    # Evaluate
+    y_pred_val = model.predict(X_val)
+    rmse = np.sqrt(mean_squared_error(y_val, y_pred_val))
+    print(f"[ML] Validation RMSE (on residuals): {rmse:.4f}")
+    
+    return model, X.columns.tolist(), y.columns.tolist()
 
-    colors = plt.cm.tab20(np.linspace(0, 1, len(sample_sats)))
+def apply_correction(df, model, feature_cols, target_diff_cols):
+    """
+    Applies the model to predict 'Real' values given 'Sim' values.
+    Real_pred = Sim + Model(Sim)
+    """
+    # Prepare Features (Sim only)
+    # We use the same logic as training but we don't need 'Real' columns here
+    sim_cols = ["x_sim", "y_sim", "z_sim", "Vx_sim", "Vy_sim", "Vz_sim"]
+    
+    # Ensure no NaNs in sim inputs
+    mask = df[sim_cols].notna().all(axis=1)
+    df_valid = df.loc[mask].copy()
+    
+    if len(df_valid) == 0:
+        return df 
+        
+    phys_feats = get_physics_features(df_valid, suffix="_sim")
+    X = pd.concat([df_valid[sim_cols], phys_feats], axis=1)
+    
+    # Align columns
+    X = X[feature_cols]
+    
+    # Predict Residuals
+    diff_preds = model.predict(X)
+    
+    # Add residuals to Sim columns to get Corrected predictions
+    out_df = df.copy()
+    
+    # Map back: diff_x -> x, etc.
+    # target_diff_cols are like ['diff_x', 'diff_y', ...]
+    base_cols = ["x", "y", "z", "Vx", "Vy", "Vz"]
+    
+    for i, col in enumerate(base_cols):
+        # We write to a new column 'x_pred', 'y_pred'...
+        # prediction = sim + predicted_diff
+        out_df.loc[mask, f"{col}_pred"] = df_valid[f"{col}_sim"] + diff_preds[:, i]
+        
+    return out_df
 
-    for i, sat in enumerate(sample_sats):
-        sub = merged_all[merged_all["sat_id"] == sat].copy()
-        one_turn = cut_after_one_orbit_3D(sub)
-        ax.plot(one_turn["x"], one_turn["y"], one_turn["z"],
-                color=colors[i], linewidth=2, label=f"sat {sat}")
+# ============================================================
+# 5) VISUALIZATION
+# ============================================================
 
-    ax.set_xlabel("x (km)")
-    ax.set_ylabel("y (km)")
-    ax.set_zlabel("z (km)")
-    ax.legend(loc="upper left", bbox_to_anchor=(1.05, 1))
-    plt.tight_layout()
-    plt.show()
-
-def plot_plotly_real_vs_sim(train_table, nb_sats=10, R_earth=6371, open_in_browser=False):
-    valid_sats = train_table["sat_id"].unique()
+def plot_matplotlib_3d_sample(df, nb_sats=15, R_earth=6371):
+    """
+    Plots a sample of satellites in 3D using Matplotlib (static plot).
+    """
+    valid_sats = df["sat_id"].unique()
     if len(valid_sats) == 0:
         return
 
     sample_sats = np.random.choice(valid_sats, size=min(nb_sats, len(valid_sats)), replace=False)
+    print(f"\\n[Viz] Plotting sample of {len(sample_sats)} satellites (Matplotlib)...")
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # Wireframe Earth
+    u = np.linspace(0, 2*np.pi, 40)
+    v = np.linspace(0, np.pi, 20)
+    xs = R_earth * np.outer(np.cos(u), np.sin(v))
+    ys = R_earth * np.outer(np.sin(u), np.sin(v))
+    zs = R_earth * np.outer(np.ones_like(u), np.cos(v))
+    ax.plot_surface(xs, ys, zs, color="lightblue", alpha=0.3, linewidth=0)
+
+    # Colors
+    colors = plt.cm.jet(np.linspace(0, 1, len(sample_sats)))
+
+    for i, sat in enumerate(sample_sats):
+        sub = df[df["sat_id"] == sat].copy()
+        # Clean numeric
+        sub = sub.dropna(subset=["x", "y", "z", "Vx", "Vy", "Vz"])
+        if len(sub) == 0: continue
+        
+        orbit = cut_after_one_orbit_3D(sub, ["x", "y", "z"], ["Vx", "Vy", "Vz"])
+        
+        if len(orbit) > 0:
+            ax.plot(orbit.x, orbit.y, orbit.z, color=colors[i], label=f"Sat {sat}")
+
+    ax.set_xlabel("x (km)")
+    ax.set_ylabel("y (km)")
+    ax.set_zlabel("z (km)")
+    ax.set_title("3D Orbits Sample")
     
+    # Check if too many legends
+    if len(sample_sats) <= 10:
+        ax.legend(loc='upper right', bbox_to_anchor=(1.1, 1))
+        
+    plt.tight_layout()
+    plt.show()
+
+def compare_trajectories(df, sat_id, R_earth=6371):
+    """
+    Plots Real vs Sim vs Corrected for a single satellite (Plotly).
+    """
+    sub = df[df["sat_id"] == sat_id].copy()
+    
+    if len(sub) < 10:
+        print(f"Not enough data for Sat {sat_id}")
+        return
+
+    # Cut 1 orbit for cleaner viz
+    # Real
+    real_orbit = cut_after_one_orbit_3D(sub, ["x", "y", "z"], ["Vx", "Vy", "Vz"])
+    # Sim
+    sim_orbit = cut_after_one_orbit_3D(sub, ["x_sim", "y_sim", "z_sim"], ["Vx_sim", "Vy_sim", "Vz_sim"])
+    # Pred
+    pred_orbit = cut_after_one_orbit_3D(sub, ["x_pred", "y_pred", "z_pred"], ["Vx_pred", "Vy_pred", "Vz_pred"])
+
     fig = go.Figure()
     
-    # sphere
+    # Earth
     u = np.linspace(0, 2*np.pi, 60)
     v = np.linspace(0, np.pi, 30)
     xs = R_earth * np.outer(np.cos(u), np.sin(v))
     ys = R_earth * np.outer(np.sin(u), np.sin(v))
     zs = R_earth * np.outer(np.ones_like(u), np.cos(v))
-    fig.add_surface(x=xs, y=ys, z=zs, colorscale="Blues", opacity=0.9, showscale=False)
+    fig.add_surface(x=xs, y=ys, z=zs, colorscale="Blues", opacity=0.6, showscale=False)
 
-    real_colors = px.colors.qualitative.Dark24
+    # Traces
+    fig.add_trace(go.Scatter3d(x=real_orbit.x, y=real_orbit.y, z=real_orbit.z,
+                               mode='lines', name='Real (Ground Truth)', line=dict(color='cyan', width=5)))
+    
+    fig.add_trace(go.Scatter3d(x=sim_orbit.x_sim, y=sim_orbit.y_sim, z=sim_orbit.z_sim,
+                               mode='lines', name='Simulation (SGP4)', line=dict(color='orange', width=3, dash='dash')))
+                               
+    fig.add_trace(go.Scatter3d(x=pred_orbit.x_pred, y=pred_orbit.y_pred, z=pred_orbit.z_pred,
+                               mode='lines', name='ML Corrected', line=dict(color='lime', width=4)))
 
-    for i, sat in enumerate(sample_sats):
-        sub = train_table[train_table["sat_id"] == sat].copy()
-        real = cut_after_one_orbit_3D(sub)
-        
-        c_real = real_colors[i % len(real_colors)]
-        
-        # Real path
-        fig.add_trace(go.Scatter3d(
-            x=real["x"], y=real["y"], z=real["z"],
-            mode="lines", line=dict(color=c_real, width=6),
-            name=f"Sat {sat} (Real)"
-        ))
-
-        # Sim path check
-        sim_df = sub[["x_sim", "y_sim", "z_sim", "Vx_sim", "Vy_sim", "Vz_sim"]].copy()
-        sim_df.columns = ["x", "y", "z", "Vx", "Vy", "Vz"]
-        
-        # basic cleaning
-        for c in ["x", "y", "z", "Vx", "Vy", "Vz"]:
-            sim_df[c] = pd.to_numeric(sim_df[c], errors="coerce")
-        sim_df = sim_df.dropna()
-
-        sim_orbit = cut_after_one_orbit_3D(sim_df)
-
-        fig.add_trace(go.Scatter3d(
-            x=sim_orbit["x"], y=sim_orbit["y"], z=sim_orbit["z"],
-            mode="lines",
-            line=dict(color='white', width=3, dash="dash"), # simplified color logic
-            opacity=0.7,
-            name=f"Sat {sat} (Sim)"
-        ))
-
-    fig.update_layout(template="plotly_dark", scene=dict(aspectmode="data"))
-    if open_in_browser:
-        import plotly.io as pio
-        pio.renderers.default = "browser"
+    fig.update_layout(
+        title=f"Trajectory Correction: Sat {sat_id}",
+        template="plotly_dark",
+        scene=dict(aspectmode='data')
+    )
     fig.show()
 
-def add_features(df):
-    df = df.copy()
-    # Basic kinematics
-    df["r"] = np.sqrt(df["x"]**2 + df["y"]**2 + df["z"]**2)
-    df["speed"] = np.sqrt(df["Vx"]**2 + df["Vy"]**2 + df["Vz"]**2)
-    df["altitude"] = df["r"] - 6371.0
-    df["theta_xy"] = np.arctan2(df["y"], df["x"])
-
-    # Angular momentum
-    hx = df["y"]*df["Vz"] - df["z"]*df["Vy"]
-    hy = df["z"]*df["Vx"] - df["x"]*df["Vz"]
-    hz = df["x"]*df["Vy"] - df["y"]*df["Vx"]
-    df["h_norm"] = np.sqrt(hx**2 + hy**2 + hz**2)
-    df["incl"] = np.degrees(np.arccos(hz / (df["h_norm"] + 1e-9)))
-    return df
-
-def train_rf_direct_model(df_ml, feature_cols, target_cols, n_samples=5000):
-    # Predict sim from real directly
-    df_ml = df_ml.dropna(subset=target_cols).copy()
-    
-    # Subsampling for speed
-    n_samples_eff = min(n_samples, df_ml.shape[0])
-    df_s = df_ml.sample(n_samples_eff, random_state=42).copy()
-
-    X = df_s[feature_cols]
-    y = df_s[target_cols]
-
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-
-    # Base RF model
-    rf = RandomForestRegressor(n_estimators=60, max_depth=12, n_jobs=-1, random_state=42)
-    rf.fit(X_train_scaled, y_train)
-    y_pred = rf.predict(X_test_scaled)
-
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    print(f"\n[Direct Model] RMSE: {rmse:.3f}")
-
-    return rf, scaler, (X_test, y_test, y_pred), df_s
-
-def train_rf_correction_model(df_s, feature_cols):
-    # Predict the residual (real - sim)
-    df_corr = df_s.copy()
-    for comp in ["x", "y", "z", "Vx", "Vy", "Vz"]:
-        df_corr[f"d_{comp}"] = df_corr[comp] - df_corr[f"{comp}_sim"]
-
-    target_corr_cols = ["d_x", "d_y", "d_z", "d_Vx", "d_Vy", "d_Vz"]
-
-    X_corr = df_corr[feature_cols]
-    y_corr = df_corr[target_corr_cols]
-
-    Xc_train, Xc_test, yc_train, yc_test = train_test_split(X_corr, y_corr, test_size=0.2, random_state=42)
-
-    scaler_corr = StandardScaler()
-    Xc_train_scaled = scaler_corr.fit_transform(Xc_train)
-    Xc_test_scaled = scaler_corr.transform(Xc_test)
-
-    rf_corr = RandomForestRegressor(n_estimators=60, max_depth=12, n_jobs=-1, random_state=42)
-    rf_corr.fit(Xc_train_scaled, yc_train)
-    
-    print("\n[Correction Model] Trained.")
-    return rf_corr, scaler_corr
-
-def compare_one_satellite_plotly(train_fe, sat, feature_cols, rf_direct, scaler_direct, rf_corr, scaler_corr):
-    sub = train_fe[train_fe["sat_id"] == sat].copy()
-
-    # Real orbit
-    real_orbit = cut_after_one_orbit_3D(sub)
-
-    # Sim orbit
-    sim_df = sub.dropna(subset=["x_sim", "y_sim", "z_sim", "Vx_sim", "Vy_sim", "Vz_sim"]).copy()
-    sim_df.rename(columns={
-        "x_sim": "x", "y_sim": "y", "z_sim": "z",
-        "Vx_sim": "Vx", "Vy_sim": "Vy", "Vz_sim": "Vz",
-    }, inplace=True)
-    sim_orbit = cut_after_one_orbit_3D(sim_df)
-
-    # ML direct
-    X_sat = scaler_direct.transform(sub[feature_cols])
-    y_pred_sat = rf_direct.predict(X_sat)
-    ml_df = pd.DataFrame(y_pred_sat, columns=["x", "y", "z", "Vx", "Vy", "Vz"])
-    ml_orbit = cut_after_one_orbit_3D(ml_df)
-
-    # ML correction
-    Xc_sat = scaler_corr.transform(sub[feature_cols])
-    d_pred = rf_corr.predict(Xc_sat)
-    d_df = pd.DataFrame(d_pred, columns=["d_x", "d_y", "d_z", "d_Vx", "d_Vy", "d_Vz"])
-
-    # Corrected = Sim + Predicted_Residual
-    corr_df = pd.DataFrame({
-        "x": sub["x_sim"].values + d_df["d_x"].values,
-        "y": sub["y_sim"].values + d_df["d_y"].values,
-        "z": sub["z_sim"].values + d_df["d_z"].values,
-    }).dropna()
-    # Need velocities for the cutter to work, hacking them in
-    corr_df["Vx"] = 0 
-    corr_df["Vy"] = 0
-    corr_df["Vz"] = 0
-    
-    # Just plot raw points for correction to avoid the complex cutter failing on bad velocity data
-    # ...
-
-    fig = go.Figure()
-    
-    # Real
-    fig.add_trace(go.Scatter3d(x=real_orbit["x"], y=real_orbit["y"], z=real_orbit["z"],
-                               mode="lines", name="Real", line=dict(color="cyan", width=5)))
-    # Sim
-    fig.add_trace(go.Scatter3d(x=sim_orbit["x"], y=sim_orbit["y"], z=sim_orbit["z"],
-                               mode="lines", name="Sim", line=dict(color="yellow", width=3, dash="dash")))
-    # Direct ML
-    fig.add_trace(go.Scatter3d(x=ml_orbit["x"], y=ml_orbit["y"], z=ml_orbit["z"],
-                               mode="lines", name="ML Direct", line=dict(color="magenta", width=3)))
-    
-    # Correction
-    # plotting all points instead of cut orbit for safety
-    fig.add_trace(go.Scatter3d(x=corr_df["x"], y=corr_df["y"], z=corr_df["z"],
-                               mode="markers", name="ML Corrected", marker=dict(color="lime", size=2)))
-
-    fig.update_layout(title=f"Sat {sat} Comparison", template="plotly_dark")
-    fig.show()
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    # Use current directory
+    # 1. Setup
     path = os.getcwd()
-
-    train_df, test_df, answer_df, train_table, test_preds, merged_all = load_data(path)
-    show_df(merged_all, "Merged Data")
-
-    # Save metrics
-    metrics_path = os.path.join(path, "satellite_metrics.csv")
-    compute_train_metrics(train_table, metrics_path)
-
-    # Visualization
-    plot_matplotlib_3d_sample(merged_all)
-    plot_plotly_real_vs_sim(train_table)
-
-    # ML Prep
-    train_fe = add_features(train_table)
     
-    feats = ["x", "y", "z", "Vx", "Vy", "Vz", "r", "speed", "altitude", "theta_xy", "h_norm", "incl"]
-    targets = ["x_sim", "y_sim", "z_sim", "Vx_sim", "Vy_sim", "Vz_sim"]
-
-    df_ml = train_fe.dropna(subset=targets).copy()
-
-    # Train
-    rf_direct, scaler_direct, _, df_sampled = train_rf_direct_model(df_ml, feats, targets)
-    rf_corr, scaler_corr = train_rf_correction_model(df_sampled, feats)
-
-    # Compare
-    test_sat = int(df_sampled["sat_id"].iloc[0])
-    compare_one_satellite_plotly(train_fe, test_sat, feats, rf_direct, scaler_direct, rf_corr, scaler_corr)
+    # 2. Load
+    train_table, test_preds, merged_all = load_data(path)
+    
+    # 3. Viz 1: Overview
+    # Plotting this BEFORE training to show "what we have"
+    plot_matplotlib_3d_sample(merged_all)
+    
+    # 4. Train Model (Sim -> Residual)
+    # We train on a subset to be fast (or full set if time permits)
+    # For this demo, let's use a sample of 20 satellites to speed up
+    sample_sats = train_table["sat_id"].unique()[:20] 
+    train_subset = train_table[train_table["sat_id"].isin(sample_sats)]
+    
+    model, feats, targets = train_correction_model(train_subset)
+    
+    # 5. Apply to Test Set (or a holdout validation satellite)
+    print("\\n[Prediction] Applying model to Test set...")
+    test_res = apply_correction(test_preds, model, feats, targets)
+    
+    # 6. Evaluation & Viz 2: Detailed Correction
+    # Let's pick a random satellite from the Test set to visualize
+    test_sats = test_res["sat_id"].unique()
+    if len(test_sats) > 0:
+        sid = np.random.choice(test_sats)
+        print(f"\\nVisualizing Satellite {sid} from Test Set...")
+        compare_trajectories(test_res, sid)
+        
+        # Calculate improvement metric on this satellite
+        sub = test_res[test_res["sat_id"] == sid]
+        base_err = np.linalg.norm(sub[["x","y","z"]].values - sub[["x_sim","y_sim","z_sim"]].values, axis=1).mean()
+        ml_err = np.linalg.norm(sub[["x","y","z"]].values - sub[["x_pred","y_pred","z_pred"]].values, axis=1).mean()
+        
+        print(f"--- Sat {sid} Error Analysis ---")
+        print(f"Base Simulation Error: {base_err:.3f} km")
+        print(f"ML Corrected Error:    {ml_err:.3f} km")
+        print(f"Improvement:           {(base_err - ml_err):.3f} km")
+        
+    print("\\nDone.")
 
 if __name__ == "__main__":
     main()
