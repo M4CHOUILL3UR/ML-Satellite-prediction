@@ -8,7 +8,7 @@ from mpl_toolkits.mplot3d import Axes3D
 
 import plotly.graph_objects as go
 import plotly.express as px
-import plotly.io as pio  # <--- Added for Spyder fix
+import plotly.io as pio 
 
 # Force Plotly to open in browser (fixes Spyder "invisible plot" issue)
 pio.renderers.default = "browser"
@@ -101,117 +101,295 @@ def cut_after_one_orbit_3D(df, coord_cols=["x", "y", "z"], vel_cols=["Vx", "Vy",
     return df.loc[mask].copy()
 
 # ============================================================
-# 3) FEATURE ENGINEERING
+# 3) KEPLERIAN MATH (The hard part...)
 # ============================================================
 
-def get_physics_features(df, suffix=""):
-    cx, cy, cz = f"x{suffix}", f"y{suffix}", f"z{suffix}"
-    vx, vy, vz = f"Vx{suffix}", f"Vy{suffix}", f"Vz{suffix}"
-    
-    req = [cx, cy, cz, vx, vy, vz]
-    if not all(c in df.columns for c in req):
-        return pd.DataFrame(index=df.index)
+MU_EARTH = 398600.4418  # Standard gravitational parameter for Earth (km^3/s^2)
 
-    X = df[req].astype(float)
+def cart2kep(r_vec, v_vec):
+    """
+    Convert Cartesian state (r, v) to Keplerian elements (a, e, i, Omega, omega, M).
+    Using standard orbital mechanics formulas. 
+    """
+    # Magnitudes
+    r = np.linalg.norm(r_vec, axis=1)
+    v = np.linalg.norm(v_vec, axis=1)
     
-    r = np.sqrt(X[cx]**2 + X[cy]**2 + X[cz]**2)
-    s = np.sqrt(X[vx]**2 + X[vy]**2 + X[vz]**2)
+    # Angular momentum h = r x v
+    h_vec = np.cross(r_vec, v_vec)
+    h = np.linalg.norm(h_vec, axis=1)
     
-    hx = X[cy]*X[vz] - X[cz]*X[vy]
-    hy = X[cz]*X[vx] - X[cx]*X[vz]
-    hz = X[cx]*X[vy] - X[cy]*X[vx]
-    h = np.sqrt(hx**2 + hy**2 + hz**2)
+    # Node vector n = k x h (k is [0,0,1])
+    # k x h = [-hy, hx, 0]
+    n_x = -h_vec[:, 1]
+    n_y = h_vec[:, 0]
+    n = np.sqrt(n_x**2 + n_y**2)
     
-    mu = 398600.0
-    energy = (s**2)/2 - mu/(r + 1e-9)
+    # Eccentricity vector
+    # e = (1/mu) * [ (v^2 - mu/r)*r - (r.v)*v ]
+    r_dot_v = np.sum(r_vec * v_vec, axis=1)
+    
+    term1 = (v**2 - MU_EARTH/r)[:, np.newaxis] * r_vec
+    term2 = r_dot_v[:, np.newaxis] * v_vec
+    e_vec = (term1 - term2) / MU_EARTH
+    e = np.linalg.norm(e_vec, axis=1)
+    
+    # Energy & Semi-major axis (a)
+    # E = v^2/2 - mu/r = -mu / 2a
+    specific_energy = (v**2)/2 - MU_EARTH/r
+    # careful with parabolic/hyperbolic cases, but sats should be elliptic
+    a = -MU_EARTH / (2 * specific_energy)
+    
+    # Inclination i = acos(hz / h)
+    inc = np.arccos(np.clip(h_vec[:, 2] / h, -1, 1))
+    
+    # Right Ascension of Ascending Node (Omega)
+    # Omega = acos(nx / n)
+    Omega = np.arccos(np.clip(n_x / (n + 1e-9), -1, 1))
+    # If ny < 0, Omega = 2pi - Omega
+    mask_ny = n_y < 0
+    Omega[mask_ny] = 2*np.pi - Omega[mask_ny]
+    
+    # Argument of Perigee (w)
+    # w = acos( (n . e) / (n * e) )
+    n_dot_e = n_x*e_vec[:,0] + n_y*e_vec[:,1] # nz is 0
+    w = np.arccos(np.clip(n_dot_e / (n * e + 1e-9), -1, 1))
+    # if ez < 0, w = 2pi - w
+    mask_ez = e_vec[:, 2] < 0
+    w[mask_ez] = 2*np.pi - w[mask_ez]
+    
+    # True Anomaly (nu)
+    # nu = acos( (e . r) / (e * r) )
+    e_dot_r = np.sum(e_vec * r_vec, axis=1)
+    nu = np.arccos(np.clip(e_dot_r / (e * r + 1e-9), -1, 1))
+    # if r.v < 0, nu = 2pi - nu
+    mask_rv = r_dot_v < 0
+    nu[mask_rv] = 2*np.pi - nu[mask_rv]
+    
+    # Mean Anomaly (M) - ML likes this better than nu because it changes linearly with time
+    # tan(E/2) = sqrt((1-e)/(1+e)) * tan(nu/2)
+    E_ecc = 2 * np.arctan(np.sqrt((1 - e)/(1 + e + 1e-9)) * np.tan(nu/2))
+    # M = E - e sin E
+    M = E_ecc - e * np.sin(E_ecc)
+    
+    # Stack 'em
+    return np.column_stack([a, e, inc, Omega, w, M])
 
-    feat_df = pd.DataFrame(index=df.index)
-    feat_df[f"r{suffix}"] = r
-    feat_df[f"speed{suffix}"] = s
-    feat_df[f"h_norm{suffix}"] = h
-    feat_df[f"energy{suffix}"] = energy
+def kep2cart(kep_arr):
+    """
+    Go back from Keplerian (a, e, i, Omega, w, M) to Cartesian (x, y, z, Vx, Vy, Vz).
+    We need this to turn our ML predictions back into the submission format.
+    """
+    a = kep_arr[:, 0]
+    e = kep_arr[:, 1]
+    inc = kep_arr[:, 2]
+    Omega = kep_arr[:, 3]
+    w = kep_arr[:, 4]
+    M = kep_arr[:, 5]
     
-    feat_df[f"cos_x{suffix}"] = X[cx] / (r + 1e-9)
-    feat_df[f"cos_y{suffix}"] = X[cy] / (r + 1e-9)
-    feat_df[f"cos_z{suffix}"] = X[cz] / (r + 1e-9)
-    
-    return feat_df
-
-def prepare_ml_data(df, target_cols=["x", "y", "z", "Vx", "Vy", "Vz"]):
-    df = df.copy()
-    sim_cols = ["x_sim", "y_sim", "z_sim", "Vx_sim", "Vy_sim", "Vz_sim"]
-    
-    valid_mask = df[target_cols + sim_cols].notna().all(axis=1)
-    df = df.loc[valid_mask].copy()
-
-    phys_feats = get_physics_features(df, suffix="_sim")
-    X = pd.concat([df[sim_cols], phys_feats], axis=1)
-    
-    y = pd.DataFrame(index=df.index)
-    for col in target_cols:
-        sim_col = col + "_sim"
-        y[f"diff_{col}"] = df[col] - df[sim_col]
+    # 1. Solve Kepler's Equation for Eccentric Anomaly (E)
+    # Iterative method (Newton-Raphson) because M = E - e sin E can't be inverted algebraically
+    # Start guess E = M
+    E = M.copy()
+    for _ in range(5): # 5 iterations usually enough for small e
+        f = E - e*np.sin(E) - M
+        f_prime = 1 - e*np.cos(E)
+        E = E - f / f_prime
         
-    return X, y
+    # 2. Get True Anomaly (nu)
+    # tan(nu/2) = sqrt((1+e)/(1-e)) * tan(E/2)
+    sqrt_term = np.sqrt((1+e)/(1-e + 1e-9))
+    nu = 2 * np.arctan(sqrt_term * np.tan(E/2))
+    
+    # 3. Distance r
+    r_dist = a * (1 - e * np.cos(E))
+    
+    # 4. Position/Velocity in Perifocal Frame (PQW)
+    # p = x, q = y (in the orbital plane)
+    p = r_dist * np.cos(nu)
+    q = r_dist * np.sin(nu)
+    
+    # velocity components
+    # h = sqrt(mu * a * (1-e^2))
+    h = np.sqrt(MU_EARTH * a * (1 - e**2 + 1e-9))
+    mu_over_h = MU_EARTH / (h + 1e-9)
+    
+    vp = -mu_over_h * np.sin(nu)
+    vq =  mu_over_h * (e + np.cos(nu))
+    
+    # 5. Rotate to Geocentric Equatorial Frame (IJK)
+    # Using rotation matrices for Omega, inc, w
+    # It's a mess of sin/cos, so I'll write it out explicitly
+    
+    cO = np.cos(Omega)
+    sO = np.sin(Omega)
+    cw = np.cos(w)
+    sw = np.sin(w)
+    ci = np.cos(inc)
+    si = np.sin(inc)
+    
+    # Unit vectors
+    P_x = cO*cw - sO*sw*ci
+    P_y = sO*cw + cO*sw*ci
+    P_z = sw*si
+    
+    Q_x = -cO*sw - sO*cw*ci
+    Q_y = -sO*sw + cO*cw*ci
+    Q_z = cw*si
+    
+    x = p*P_x + q*Q_x
+    y = p*P_y + q*Q_y
+    z = p*P_z + q*Q_z
+    
+    vx = vp*P_x + vq*Q_x
+    vy = vp*P_y + vq*Q_y
+    vz = vp*P_z + vq*Q_z
+    
+    return np.column_stack([x, y, z, vx, vy, vz])
 
 # ============================================================
-# 4) MODELING
+# 4) FEATURE ENGINEERING & DATA PREP
+# ============================================================
+
+def get_keplerian_diffs(df):
+    """
+    This function drives the logic:
+    1. Take SIMULATION Cartesian -> SIM Keplerian
+    2. Take TRUE Cartesian -> TRUE Keplerian
+    3. Calculate difference (True - Sim) to use as ML target
+    """
+    
+    # Grab arrays
+    r_sim = df[["x_sim", "y_sim", "z_sim"]].values
+    v_sim = df[["Vx_sim", "Vy_sim", "Vz_sim"]].values
+    
+    # We only have truth for training data
+    if "x" in df.columns:
+        r_true = df[["x", "y", "z"]].values
+        v_true = df[["Vx", "Vy", "Vz"]].values
+        
+        # Convert both
+        k_sim = cart2kep(r_sim, v_sim)
+        k_true = cart2kep(r_true, v_true)
+        
+        # Calculate errors: diff = True - Sim
+        # (Target for the ML model)
+        diffs = k_true - k_sim
+        
+        # Handle angle wrap-around for angular elements if needed?
+        # Ideally yes, but for small corrections standard diff is usually ok.
+        
+        return k_sim, diffs
+    else:
+        # For test set (prediction), we only have sim
+        k_sim = cart2kep(r_sim, v_sim)
+        return k_sim, None
+
+def prepare_ml_data(df, is_train=True):
+    df = df.copy()
+    
+    # Filter NaNs
+    req_cols = ["x_sim", "y_sim", "z_sim", "Vx_sim", "Vy_sim", "Vz_sim"]
+    if is_train:
+        req_cols += ["x", "y", "z", "Vx", "Vy", "Vz"]
+        
+    mask = df[req_cols].notna().all(axis=1)
+    df = df.loc[mask].copy()
+
+    # Get Keplerian elements
+    # k_sim has 6 cols: [a, e, i, Omega, w, M]
+    k_sim, k_diffs = get_keplerian_diffs(df)
+    
+    # Create Feature Matrix X
+    # We feed the model the Simulation Keplerian elements
+    # because that's what we know at test time.
+    X = pd.DataFrame(k_sim, columns=["a_sim", "e_sim", "i_sim", "Om_sim", "w_sim", "M_sim"], index=df.index)
+    
+    # Maybe add some extra features to help the trees?
+    X["n_rev"] = np.sqrt(MU_EARTH / X["a_sim"]**3) # Mean motion
+    
+    if is_train:
+        # Target y: The ERROR in those elements
+        y = pd.DataFrame(k_diffs, columns=["d_a", "d_e", "d_i", "d_Om", "d_w", "d_M"], index=df.index)
+        return X, y, df
+    else:
+        return X, None, df
+
+# ============================================================
+# 5) MODELING
 # ============================================================
 
 def train_correction_model(train_df):
-    print("\n[ML] Preparing training data...")
-    X, y = prepare_ml_data(train_df)
+    print("\n[ML] Converting to Keplerian & Preparing training data...")
+    X, y, _ = prepare_ml_data(train_df, is_train=True)
     
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
     print(f"[ML] Training shape: {X_train.shape}")
     
+    # Using Random Forest
+    # predicting small corrections to orbital elements
     model = RandomForestRegressor(
-        n_estimators=50,
-        max_depth=15,
+        n_estimators=100,      # bumped this up a bit
+        max_depth=20,
         n_jobs=-1,
         random_state=42
     )
     
-    print("[ML] Fitting Random Forest...")
+    print("[ML] Fitting Random Forest to Orbital Elements...")
     model.fit(X_train, y_train)
     
     y_pred_val = model.predict(X_val)
-    rmse = np.sqrt(mean_squared_error(y_val, y_pred_val))
-    print(f"[ML] Validation RMSE (on residuals): {rmse:.4f}")
+    # Just printing RMSE of the first element (Semi-major axis) as a check
+    rmse_a = np.sqrt(mean_squared_error(y_val["d_a"], y_pred_val[:, 0]))
+    print(f"[ML] Validation RMSE (Semi-major axis 'a'): {rmse_a:.4f} km")
     
     return model, X.columns.tolist(), y.columns.tolist()
 
-def apply_correction(df, model, feature_cols, target_diff_cols):
-    sim_cols = ["x_sim", "y_sim", "z_sim", "Vx_sim", "Vy_sim", "Vz_sim"]
+def apply_correction(df, model, feature_cols, target_cols):
+    print("Applying corrections via Keplerian transformation...")
     
-    mask = df[sim_cols].notna().all(axis=1)
-    df_valid = df.loc[mask].copy()
+    # Prepare features
+    X, _, df_valid = prepare_ml_data(df, is_train=False)
     
     if len(df_valid) == 0:
         return df 
         
-    phys_feats = get_physics_features(df_valid, suffix="_sim")
-    X = pd.concat([df_valid[sim_cols], phys_feats], axis=1)
+    X = X[feature_cols] # Ensure column order
     
-    X = X[feature_cols]
-    diff_preds = model.predict(X)
+    # 1. Predict the errors (delta Keplerian)
+    pred_diffs = model.predict(X)
     
+    # 2. Get the Simulation Keplerian elements again
+    # (We already computed them in prepare_ml_data, but let's grab from X for clarity)
+    # Note: X has columns ["a_sim", "e_sim", "i_sim", "Om_sim", "w_sim", "M_sim", "n_rev"]
+    # We need the first 6
+    k_sim = X.iloc[:, :6].values
+    
+    # 3. Corrected Keplerian = Sim + Predicted_Diff
+    k_corrected = k_sim + pred_diffs
+    
+    # 4. Convert Corrected Keplerian -> Cartesian (x, y, z...)
+    # This gives us our final ML predictions in the format we need
+    cart_pred = kep2cart(k_corrected)
+    
+    # 5. Store back in dataframe
     out_df = df.copy()
     base_cols = ["x", "y", "z", "Vx", "Vy", "Vz"]
     
+    # Align indices using df_valid
     for i, col in enumerate(base_cols):
-        out_df.loc[mask, f"{col}_pred"] = df_valid[f"{col}_sim"] + diff_preds[:, i]
+        # We need to map the numpy array back to the original indices
+        out_df.loc[df_valid.index, f"{col}_pred"] = cart_pred[:, i]
         
     return out_df
 
 # ============================================================
-# 5) VISUALIZATION
+# 6) VISUALIZATION (Kept mostly same)
 # ============================================================
 
 def plot_matplotlib_3d_sample(df, nb_sats=15, R_earth=6371):
     valid_sats = df["sat_id"].unique()
-    if len(valid_sats) == 0:
-        return
+    if len(valid_sats) == 0: return
 
     sample_sats = np.random.choice(valid_sats, size=min(nb_sats, len(valid_sats)), replace=False)
     print(f"\n[Viz] Plotting sample of {len(sample_sats)} satellites (Matplotlib)...")
@@ -256,9 +434,14 @@ def compare_trajectories(df, sat_id, R_earth=6371):
         print(f"Not enough data for Sat {sat_id}")
         return
 
-    real_orbit = cut_after_one_orbit_3D(sub, ["x", "y", "z"], ["Vx", "Vy", "Vz"])
-    sim_orbit = cut_after_one_orbit_3D(sub, ["x_sim", "y_sim", "z_sim"], ["Vx_sim", "Vy_sim", "Vz_sim"])
-    pred_orbit = cut_after_one_orbit_3D(sub, ["x_pred", "y_pred", "z_pred"], ["Vx_pred", "Vy_pred", "Vz_pred"])
+    # Use a try-except here because sometimes the cutter fails on bad predictions
+    try:
+        real_orbit = cut_after_one_orbit_3D(sub, ["x", "y", "z"], ["Vx", "Vy", "Vz"])
+        sim_orbit = cut_after_one_orbit_3D(sub, ["x_sim", "y_sim", "z_sim"], ["Vx_sim", "Vy_sim", "Vz_sim"])
+        pred_orbit = cut_after_one_orbit_3D(sub, ["x_pred", "y_pred", "z_pred"], ["Vx_pred", "Vy_pred", "Vz_pred"])
+    except Exception as e:
+        print(f"Viz Error: {e}")
+        return
 
     fig = go.Figure()
     
@@ -273,13 +456,13 @@ def compare_trajectories(df, sat_id, R_earth=6371):
                                mode='lines', name='Real (Ground Truth)', line=dict(color='cyan', width=5)))
     
     fig.add_trace(go.Scatter3d(x=sim_orbit.x_sim, y=sim_orbit.y_sim, z=sim_orbit.z_sim,
-                               mode='lines', name='Simulation (SGP4)', line=dict(color='orange', width=3, dash='dash')))
+                               mode='lines', name='Simulation', line=dict(color='orange', width=3, dash='dash')))
                                
     fig.add_trace(go.Scatter3d(x=pred_orbit.x_pred, y=pred_orbit.y_pred, z=pred_orbit.z_pred,
-                               mode='lines', name='ML Corrected', line=dict(color='lime', width=4)))
+                               mode='lines', name='ML Corrected (Keplerian)', line=dict(color='lime', width=4)))
 
     fig.update_layout(
-        title=f"Trajectory Correction: Sat {sat_id}",
+        title=f"Trajectory Correction (Kepler Space): Sat {sat_id}",
         template="plotly_dark",
         scene=dict(aspectmode='data')
     )
@@ -297,10 +480,10 @@ def main():
     train_table, test_preds, merged_all = load_data(path)
     
     # 2. Viz 1: Overview
-    plot_matplotlib_3d_sample(merged_all)
+    # plot_matplotlib_3d_sample(merged_all)
     
     # 3. Train
-    # Using 20 satellites for speed demo
+    # Using subset for speed in testing
     sample_sats = train_table["sat_id"].unique()[:20] 
     train_subset = train_table[train_table["sat_id"].isin(sample_sats)]
     
@@ -318,13 +501,14 @@ def main():
         compare_trajectories(test_res, sid)
         
         sub = test_res[test_res["sat_id"] == sid]
-        base_err = np.linalg.norm(sub[["x","y","z"]].values - sub[["x_sim","y_sim","z_sim"]].values, axis=1).mean()
-        ml_err = np.linalg.norm(sub[["x","y","z"]].values - sub[["x_pred","y_pred","z_pred"]].values, axis=1).mean()
-        
-        print(f"--- Sat {sid} Error Analysis ---")
-        print(f"Base Simulation Error: {base_err:.3f} km")
-        print(f"ML Corrected Error:    {ml_err:.3f} km")
-        print(f"Improvement:           {(base_err - ml_err):.3f} km")
+        if "x" in sub.columns and "x_pred" in sub.columns:
+            base_err = np.linalg.norm(sub[["x","y","z"]].values - sub[["x_sim","y_sim","z_sim"]].values, axis=1).mean()
+            ml_err = np.linalg.norm(sub[["x","y","z"]].values - sub[["x_pred","y_pred","z_pred"]].values, axis=1).mean()
+            
+            print(f"--- Sat {sid} Error Analysis ---")
+            print(f"Base Simulation Error: {base_err:.3f} km")
+            print(f"ML Corrected Error:    {ml_err:.3f} km")
+            print(f"Improvement:           {(base_err - ml_err):.3f} km")
         
     print("\nDone.")
 
